@@ -18,17 +18,19 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 ///////////////////////*/
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
-import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
+import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
 
 /**
-	*@title KipuBankV2 Contract
-	*@notice Este es un contrato con fines educativos.
+	*@title KipuBankV2 Contract - Multi-token Bank with USD Accounting and Chainlink Feeds
+	*@notice This contract allows users to deposit and withdraw either native ETH or ERC-20 tokens.
+    * Balances are tracked per token, and internal accounting is done in USD (8 decimals) using Chainlink price feeds.
+    * The contract includes access control for administrative functions, security patterns, and clean event-driven observability.
 	*@author Alan Gutierrez.
-	*@custom:security No usar en producción.
+	*@custom:security Do not use in production.
 */
 contract KipuBankV2 is AccessControl, ReentrancyGuard, Pausable{
     /*///////////////////////
-        DECLARACIÓN DE TIPOS
+        TYPE DECLARATIONS
     ///////////////////////*/
     using SafeERC20 for IERC20;
 
@@ -36,6 +38,7 @@ contract KipuBankV2 is AccessControl, ReentrancyGuard, Pausable{
                                 ROLES
     //////////////////////////////////////////////////////////////*/
     bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
+    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
 
     /*//////////////////////////////////////////////////////////////
                               CONSTANTS
@@ -68,57 +71,63 @@ contract KipuBankV2 is AccessControl, ReentrancyGuard, Pausable{
     mapping(address => uint256) public s_depositsPerUser;
     mapping(address => uint256) public s_withdrawsPerUser;
     /// @notice token => Chainlink price feed (token/USD). Use address(0) for native ETH/USD feed.
-    mapping(address => AggregatorV3Interface) public priceFeeds;
+    mapping(address => AggregatorV3Interface) public s_priceFeeds;
     /// @notice Optional override for token decimals when token does not implement decimals()
-    mapping(address => uint8) public tokenDecimalsOverride;
+    mapping(address => uint8) public s_tokenDecimalsOverride;
 
     /*//////////////////////////////////////////////////////////////
                                 EVENTS
     //////////////////////////////////////////////////////////////*/
-	///@notice evento emitido cuando se realiza un nuevo depósito
-	event KipuBankV2_Deposit(address indexed token, address indexed ethUSDPrice, uint256 amountToken, uint256 amountUsd, uint256 nuevoSaldo);
-	///@notice evento emitido cuando se realiza un retiro
-    event KipuBankV2_Withdraw(address indexed token, address indexed ethUSDPrice, uint256 amountToken, uint256 amountUsd, uint256 nuevoSaldo);
-	///@notice evento emitido cuando el Chainlink Feed es actualizado
+	///@notice Emitted when a new deposit is made
+	event KipuBankV2_Deposit(address indexed token, address indexed user, uint256 amountToken, uint256 amountUsd, uint256 newBalance);
+	///@notice Emitted  when a withdrawal is made
+    event KipuBankV2_Withdraw(address indexed token, address indexed user, uint256 amountToken, uint256 amountUsd, uint256 newBalance);
+    ///@notice Emitted when the Chainlink Feed is updated
     event KipuBankV2_ChainlinkFeedUpdated(address feed);
-	///@notice 
-	event KipuBankV2_PriceFeedSet(address token, address feed);
-	///@notice 
-	event KipuBankV2_TokenDecimalsOverrideSet(address indexed token, uint8 decimals);
+    /// @notice Emitted when a new Chainlink price feed is set or updated for a specific token.
+    /// @param token The address of the token associated with the feed (use address(0) for ETH).
+    /// @param feed The address of the Chainlink price feed contract.
+    event KipuBankV2_PriceFeedSet(address token, address feed);
+    /// @notice Emitted when a manual token decimals override is configured or changed.
+    /// @param token The address of the token for which decimals are overridden.
+    /// @param decimals The new decimals value assigned to the token.
+    event KipuBankV2_TokenDecimalsOverrideSet(address indexed token, uint8 decimals);
 
 	/*///////////////////////
 						Errors
 	///////////////////////*/
-	/// @notice Se lanza si el depósito excede el cap global.
+	/// @notice Thrown when the deposit exceeds the global cap.
     error KipuBankV2_BankCapExceeded(uint256 attemptedUsd8, uint256 bankCapUsd8);
-    /// @notice Se lanza si el retiro excede el límite por transacción.
+    /// @notice Thrown when the withdrawal exceeds the transaction limit.
     error KipuBankV2_WithdrawExceedsLimit(uint256 requestedUsd8, uint256 perTxLimitUsd8);
-    /// @notice Se lanza si el usuario no tiene saldo suficiente.
+    /// @notice Thrown when the user does not have sufficient balance.
     error KipuBankV2_InsufficientBalance(uint256 balance, uint256 requested);
-	///@notice error emitido cuando falla una transacción
-    error KipuBankV2_TransaccionFallida(address usuario, uint256 valor, bytes error);
-	///@notice error emitido cuando el valor a depositar o retirar es cero
+	/// @notice Thrown when a transaction fails
+    error KipuBankV2_TransferFailed(address to, uint256 value);
+	/// @notice Thrown when the amount to be deposited or withdrawn is zero
 	error KipuBankV2_ZeroAmount();
-	///@notice 
-	error KipuBankV2_Paused();
-	///@notice 
-	error KipuBankV2_NotAdmin(address who);
-	///@notice error emitido cuando el retorno del oráculo es incorrecto
+    /// @notice Thrown when a function is called while the contract is paused.
+    error KipuBankV2_Paused();
+    /// @notice Thrown when a caller without admin privileges attempts an admin-only action.
+    /// @param who The address that attempted the restricted action.
+    error KipuBankV2_NotAdmin(address who);
+    /// @notice Thrown when the oracle returns an invalid or zero price.
     error KipuBankV2_OracleCompromised();
-    ///@notice error emitido cuando la última actualización del oráculo supera el heartbeat
+    /// @notice Thrown when the latest oracle update is older than the allowed heartbeat period.
+    /// @param updatedAt The timestamp of the last oracle update.
+    /// @param nowTimestamp The current block timestamp.
     error KipuBankV2_StalePrice(uint256 updatedAt, uint256 nowTimestamp);
+    /// @notice Thrown when no Chainlink price feed has been set for the given token.
+    /// @param token The token address for which no price feed is configured.
     error KipuBankV2_PriceFeedNotSet(address token);
+    /// @notice Thrown when an invalid (zero) address is provided as an argument.
     error KipuBankV2_InvalidAddress();
 
 	/*///////////////////////////////////
             			Modifiers
 	///////////////////////////////////*/
-	/// @notice Requiere que msg.value > 0 (para funciones payable).
-    modifier ValorCero() {
-        if (msg.value == 0) revert KipuBankV2_ZeroAmount();
-        _;
-    }
-
+    /// @notice Requires that the caller has the DEFAULT_ADMIN_ROLE.
+    /// @dev Reverts with KipuBankV2_NotAdmin if msg.sender does not have the admin role.
     modifier onlyAdmin() {
         if (!hasRole(DEFAULT_ADMIN_ROLE, msg.sender)) revert KipuBankV2_NotAdmin(msg.sender);
         _;
@@ -157,7 +166,7 @@ contract KipuBankV2 is AccessControl, ReentrancyGuard, Pausable{
     }
 
     fallback() external payable {
-        revert("Use depositETH()");
+        revert("Invalid call");
     }
     
 	/*//////////////////////////////////////////////////////////////
@@ -170,7 +179,7 @@ contract KipuBankV2 is AccessControl, ReentrancyGuard, Pausable{
      */
     function setPriceFeed(address _token, address _feed) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (_feed == address(0)) revert KipuBankV2_InvalidAddress();
-        priceFeeds[_token] = AggregatorV3Interface(_feed);
+        s_priceFeeds[_token] = AggregatorV3Interface(_feed);
         emit KipuBankV2_PriceFeedSet(_token, _feed);
     }
 
@@ -179,7 +188,7 @@ contract KipuBankV2 is AccessControl, ReentrancyGuard, Pausable{
      * @dev Only admin may call.
      */
     function setTokenDecimalsOverride(address _token, uint8 decimals_) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        tokenDecimalsOverride[_token] = decimals_;
+        s_tokenDecimalsOverride[_token] = decimals_;
         emit KipuBankV2_TokenDecimalsOverrideSet(_token, decimals_);
     }
 
@@ -204,11 +213,10 @@ contract KipuBankV2 is AccessControl, ReentrancyGuard, Pausable{
     /**
      * @notice Deposit native ETH. Requires price feed for address(0) to be set.
      */
-    function depositETH() external payable whenNotPaused nonReentrant {
+    function depositETH() public payable whenNotPaused nonReentrant {
         if (msg.value == 0) revert KipuBankV2_ZeroAmount();
 
         uint256 amountUsd8 = _getUsdValue(address(0), msg.value);
-
         uint256 newTotalUsd8 = s_totalUsdDeposited8 + amountUsd8;
         if (newTotalUsd8 > s_bankCapUsd8) revert KipuBankV2_BankCapExceeded(newTotalUsd8, s_bankCapUsd8);
 
@@ -235,7 +243,6 @@ contract KipuBankV2 is AccessControl, ReentrancyGuard, Pausable{
         IERC20(_token).safeTransferFrom(msg.sender, address(this), _amount);
 
         uint256 amountUsd8 = _getUsdValue(_token, _amount);
-
         uint256 newTotalUsd8 = s_totalUsdDeposited8 + amountUsd8;
         if (newTotalUsd8 > s_bankCapUsd8) revert KipuBankV2_BankCapExceeded(newTotalUsd8, s_bankCapUsd8);
 
@@ -243,7 +250,7 @@ contract KipuBankV2 is AccessControl, ReentrancyGuard, Pausable{
         s_balances[_token][msg.sender] += _amount;
         s_totalDepositedPerToken[_token] += _amount;
         s_totalUsdDeposited8 = newTotalUsd8;
-        s_totalDepositOps += 1;
+        s_totalDepositOps += 1;        
         s_depositsPerUser[msg.sender] += 1;
 
         emit KipuBankV2_Deposit(_token, msg.sender, _amount, amountUsd8, s_balances[_token][msg.sender]);
@@ -268,16 +275,15 @@ contract KipuBankV2 is AccessControl, ReentrancyGuard, Pausable{
 
         // Effects
         s_balances[address(0)][msg.sender] = bal - _amountWei;
-        s_totalDepositedPerToken[address(0)] -= _amountWei;
         s_totalUsdWithdrawn8 += amountUsd8;
         s_totalWithdrawOps += 1;
         s_withdrawsPerUser[msg.sender] += 1;
 
+        (bool success, ) = msg.sender.call{value: _amountWei}("");
+        if (!success) revert KipuBankV2_TransferFailed(msg.sender, _amountWei);
+
         emit KipuBankV2_Withdraw(address(0), msg.sender, _amountWei, amountUsd8, s_balances[address(0)][msg.sender]);
 
-        // Interaction
-        (bool sent, ) = msg.sender.call{value: _amountWei}("");
-        if (!sent) revert KipuBankV2_OracleCompromised(); // reuse error; alternative: create TransferFailed error
     }
 
     /**
@@ -297,7 +303,6 @@ contract KipuBankV2 is AccessControl, ReentrancyGuard, Pausable{
 
         // Effects
         s_balances[_token][msg.sender] = bal - _amount;
-        s_totalDepositedPerToken[_token] -= _amount;
         s_totalUsdWithdrawn8 += amountUsd8;
         s_totalWithdrawOps += 1;
         s_withdrawsPerUser[msg.sender] += 1;
@@ -342,9 +347,9 @@ contract KipuBankV2 is AccessControl, ReentrancyGuard, Pausable{
     /**
      * @dev Internal: convert token amount -> USD with USD_DECIMALS using Chainlink feed price (price decimals vary).
      */
-    function _getUsdValue(address token, uint256 amount) internal view returns (uint256) {
-        AggregatorV3Interface agg = priceFeeds[token];
-        if (address(agg) == address(0)) revert KipuBankV2_PriceFeedNotSet(token);
+    function _getUsdValue(address _token, uint256 _amount) internal view returns (uint256) {
+        AggregatorV3Interface agg = s_priceFeeds[_token];
+        if (address(agg) == address(0)) revert KipuBankV2_PriceFeedNotSet(_token);
 
         (, int256 priceRaw, , uint256 updatedAt, ) = agg.latestRoundData();
         if (priceRaw <= 0) revert KipuBankV2_OracleCompromised();
@@ -352,30 +357,21 @@ contract KipuBankV2 is AccessControl, ReentrancyGuard, Pausable{
 
         uint8 priceDecimals = agg.decimals();
 
-        uint8 tokenDecimals;
-        if (token == address(0)) {
-            tokenDecimals = 18;
-        } else {
-            // try to get token decimals(), fallback to override if it reverts
-            try IERC20Metadata(token).decimals() returns (uint8 d) {
-                tokenDecimals = d;
-            } catch {
-                tokenDecimals = tokenDecimalsOverride[token];
-                // If override is zero, assume 18 to be safe (alternatively revert)
-                if (tokenDecimals == 0) {
-                    tokenDecimals = 18;
-                }
-            }
+        uint8 tokenDecimals = _getTokenDecimals(_token);
+
+        // Normalize to 8 decimals (USDC style)
+        uint256 numerator = _amount * uint256(priceRaw);
+        uint256 scaledNumerator = (numerator * (10 ** USD_DECIMALS)) / (10 ** tokenDecimals);
+        return scaledNumerator / (10 ** priceDecimals);
+    }
+
+    function _getTokenDecimals(address _token) internal view returns (uint8) {
+        if (_token == address(0)) return 18; // ETH default
+        if (s_tokenDecimalsOverride[_token] != 0) return s_tokenDecimalsOverride[_token];
+        try IERC20Metadata(_token).decimals() returns (uint8 dec) {
+            return dec;
+        } catch {
+            return 18;
         }
-
-        // Compute:
-        // amountUsd8 = amount * priceRaw * 10**USD_DECIMALS / (10**tokenDecimals * 10**priceDecimals)
-        // Rearranged to reduce precision loss.
-        uint256 numerator = amount * uint256(uint256(priceRaw)); // amount * price
-        // multiply by USD_DECIMALS scale
-        uint256 scaledNumerator = numerator * (10 ** USD_DECIMALS);
-        uint256 denom = (10 ** tokenDecimals) * (10 ** priceDecimals);
-
-        return scaledNumerator / denom;
     }
 }
